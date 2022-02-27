@@ -1,7 +1,7 @@
 mod header;
 mod presence;
 
-use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use axum::{
     extract::{ws::WebSocket, Extension, TypedHeader, WebSocketUpgrade},
@@ -9,8 +9,10 @@ use axum::{
     routing::get,
     AddExtensionLayer, Router,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{stream, SinkExt, StreamExt, TryStreamExt};
+use tokio::sync::oneshot;
 use tower_http::trace::TraceLayer;
+use tracing::trace;
 use tracing_subscriber::EnvFilter;
 
 use self::{
@@ -26,7 +28,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(connect))
-        .layer(AddExtensionLayer::new(Presence::default()))
+        .layer(AddExtensionLayer::new(Presence::new()))
         .layer(TraceLayer::new_for_http());
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
@@ -45,18 +47,9 @@ async fn connect(
 
 #[derive(serde::Serialize)]
 enum Message {
-    Members(BTreeSet<String>),
-    Joined(String),
-    Left(String),
-}
-
-impl From<presence::Event> for Message {
-    fn from(event: presence::Event) -> Self {
-        match event {
-            presence::Event::Joined(tag) => Self::Joined(tag),
-            presence::Event::Left(tag) => Self::Left(tag),
-        }
-    }
+    Members(Vec<Arc<str>>),
+    Join(Arc<str>),
+    Leave(Arc<str>),
 }
 
 impl From<Message> for axum::extract::ws::Message {
@@ -65,25 +58,45 @@ impl From<Message> for axum::extract::ws::Message {
     }
 }
 
-async fn connection(presence: Presence, tag: String, topic: String, socket: WebSocket) {
-    let (mut tx, mut rx) = socket.split();
+enum Event {
+    Closed,
+    Event(presence::Event),
+}
 
-    let (members, mut joiners, present) = presence.join(tag, topic);
+async fn connection(presence: Presence, tag: String, topic: String, socket: WebSocket) {
+    let (members, events) = if let Ok(res) = presence.join(&topic, &tag).await {
+        res
+    } else {
+        return;
+    };
+
+    let (mut socket_tx, mut socket_rx) = socket.split();
+    let (close_tx, close_rx) = oneshot::channel::<()>();
+    let mut events = stream::select(
+        events.map_ok(Event::Event),
+        stream::once(close_rx).map(|_| Ok(Event::Closed)),
+    );
 
     tokio::spawn(async move {
-        let _present = present;
-        while rx.next().await.is_some() {}
+        // drain any incoming messages, when the stream ends the close_tx is dropped, which will end
+        // the read loop
+        let _close_tx = close_tx;
+        while socket_rx.next().await.is_some() {}
     });
 
-    if tx.send(Message::Members(members).into()).await.is_err() {
-        // client has already gone
-        return;
-    }
+    socket_tx.send(Message::Members(members).into()).await.ok();
 
-    while let Some(event) = joiners.next().await {
-        if tx.send(Message::from(event).into()).await.is_err() {
-            // client has gone
-            return;
+    while let Some(Ok(event)) = events.next().await {
+        match event {
+            Event::Event(presence::Event::Join(tag)) => {
+                socket_tx.send(Message::Join(tag).into()).await.ok();
+            }
+            Event::Event(presence::Event::Leave(tag)) => {
+                socket_tx.send(Message::Leave(tag).into()).await.ok();
+            }
+            Event::Closed => break,
         }
     }
+
+    trace!("connection closed");
 }
