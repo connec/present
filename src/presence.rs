@@ -59,12 +59,14 @@ impl Presence {
     }
 }
 
+pub struct Unavailable;
+
 // A stream that disseminates presence events.
 #[must_use]
 pub struct ParticipantEvents {
     tag: Arc<str>,
-    topic_tx: mpsc::UnboundedSender<ParticipantEvent>,
-    events_rx: BroadcastStream<TopicEvent>,
+    topic_tx: mpsc::UnboundedSender<TopicMsg>,
+    msg_rx: BroadcastStream<ParticipantMsg>,
     _alive: Arc<()>,
 }
 
@@ -72,7 +74,7 @@ impl Drop for ParticipantEvents {
     fn drop(&mut self) {
         if self
             .topic_tx
-            .send(ParticipantEvent::Leave(self.tag.clone()))
+            .send(TopicMsg::Leave(self.tag.clone()))
             .is_err()
         {
             tracing::warn!(%self.tag, "topic handler is gone");
@@ -85,7 +87,7 @@ impl ParticipantEvents {
         Self {
             tag: joined.tag,
             topic_tx: joined.topic_tx,
-            events_rx: BroadcastStream::new(joined.events_rx),
+            msg_rx: BroadcastStream::new(joined.msg_rx),
             _alive: joined.alive,
         }
     }
@@ -99,42 +101,45 @@ impl Stream for ParticipantEvents {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let item = self
-            .events_rx
+            .msg_rx
             .poll_next_unpin(cx)
-            .map_ok(|event| match event {
-                TopicEvent::Join(tag) => Event::Join(tag),
-                TopicEvent::Leave(tag) => Event::Leave(tag),
+            .map_ok(|msg| match msg {
+                ParticipantMsg::Join(tag) if tag != self.tag => Some(Event::Join(tag)),
+                ParticipantMsg::Leave(tag) if tag != self.tag => Some(Event::Leave(tag)),
+                _ => None,
             })
             .map_err(|_| Unavailable)?;
 
         match item {
-            Poll::Ready(Some(Event::Join(tag) | Event::Leave(tag))) if tag == self.tag => {
-                // skip it
-                self.poll_next(cx)
-            }
-            item => item.map(|opt| opt.map(Ok)),
+            Poll::Ready(Some(None)) => self.poll_next(cx),
+            item => item.map(|opt| opt.flatten().map(Ok)),
         }
     }
 }
-
-pub struct Unavailable;
 
 pub enum Event {
     Join(Arc<str>),
     Leave(Arc<str>),
 }
 
+struct Joined {
+    tag: Arc<str>,
+    topic_tx: mpsc::UnboundedSender<TopicMsg>,
+    members: Vec<Arc<str>>,
+    msg_rx: broadcast::Receiver<ParticipantMsg>,
+    alive: Arc<()>,
+}
+
 #[derive(Clone, Debug)]
-enum TopicEvent {
+enum ParticipantMsg {
     Join(Arc<str>),
     Leave(Arc<str>),
 }
 
 #[derive(Debug)]
-enum ParticipantEvent {
-    Ping,
+enum JoinMsg {
     Join(Join),
-    Leave(Arc<str>),
+    Close(Arc<str>),
 }
 
 struct Join {
@@ -152,18 +157,11 @@ impl fmt::Debug for Join {
     }
 }
 
-struct Joined {
-    tag: Arc<str>,
-    topic_tx: mpsc::UnboundedSender<ParticipantEvent>,
-    members: Vec<Arc<str>>,
-    events_rx: broadcast::Receiver<TopicEvent>,
-    alive: Arc<()>,
-}
-
 #[derive(Debug)]
-enum JoinEvent {
+enum TopicMsg {
+    Ping,
     Join(Join),
-    Close(Arc<str>),
+    Leave(Arc<str>),
 }
 
 struct TopicClose {
@@ -188,17 +186,17 @@ async fn handle_joins(retry: mpsc::UnboundedSender<Join>, joins: mpsc::Unbounded
     trace!("started");
 
     let mut topics = HashMap::new();
-    let mut events = stream::select(
-        UnboundedReceiverStream::new(joins).map(JoinEvent::Join),
+    let mut msgs = stream::select(
+        UnboundedReceiverStream::new(joins).map(JoinMsg::Join),
         FuturesUnordered::new()
             .filter_map(|res: Result<_, _>| Box::pin(async move { res.ok() }))
-            .map(JoinEvent::Close),
+            .map(JoinMsg::Close),
     );
 
-    while let Some(event) = events.next().await {
-        trace!(?event);
-        match event {
-            JoinEvent::Join(join) => {
+    while let Some(msg) = msgs.next().await {
+        trace!(?msg);
+        match msg {
+            JoinMsg::Join(join) => {
                 // Manually hash the topic so that `topics` doesn't store a copy of the strings
                 let mut hasher = DefaultHasher::new();
                 join.topic.hash(&mut hasher);
@@ -209,7 +207,7 @@ async fn handle_joins(retry: mpsc::UnboundedSender<Join>, joins: mpsc::Unbounded
                     let (tx, rx) = mpsc::unbounded_channel();
                     let (close_tx, close_rx) = oneshot::channel();
 
-                    events.get_ref().1.get_ref().get_ref().push(close_rx);
+                    msgs.get_ref().1.get_ref().get_ref().push(close_rx);
 
                     tokio::spawn(handle_topic(
                         join.topic.clone(),
@@ -223,11 +221,11 @@ async fn handle_joins(retry: mpsc::UnboundedSender<Join>, joins: mpsc::Unbounded
                     tx
                 });
 
-                let (s1, s2) = events.into_inner();
-                events = stream::select(s1, s2);
+                let (s1, s2) = msgs.into_inner();
+                msgs = stream::select(s1, s2);
 
-                if let Err(mpsc::error::SendError(ParticipantEvent::Join(join))) =
-                    tx.send(ParticipantEvent::Join(join))
+                if let Err(mpsc::error::SendError(TopicMsg::Join(join))) =
+                    tx.send(TopicMsg::Join(join))
                 {
                     // the topic handler has gone, remove it from the state and retry the join
                     trace!(?join, "retrying due to dropped topic");
@@ -240,13 +238,14 @@ async fn handle_joins(retry: mpsc::UnboundedSender<Join>, joins: mpsc::Unbounded
                         .expect("BUG: joins receiver gone, in loop over joins receiver?");
                 }
             }
-            JoinEvent::Close(topic) => {
+            JoinMsg::Close(topic) => {
                 // check that the sender is still gone
                 let mut hasher = DefaultHasher::new();
                 topic.hash(&mut hasher);
                 let topic_key = hasher.finish();
+
                 if let Some(tx) = topics.get(&topic_key) {
-                    if tx.send(ParticipantEvent::Ping).is_err() {
+                    if tx.send(TopicMsg::Ping).is_err() {
                         trace!(%topic, "dropped");
                         topics.remove(&topic_key);
                     }
@@ -260,20 +259,20 @@ async fn handle_joins(retry: mpsc::UnboundedSender<Join>, joins: mpsc::Unbounded
 #[tracing::instrument(skip(topic_tx, topic_rx, _close))]
 async fn handle_topic(
     topic: Arc<str>,
-    topic_tx: mpsc::UnboundedSender<ParticipantEvent>,
-    mut topic_rx: mpsc::UnboundedReceiver<ParticipantEvent>,
+    topic_tx: mpsc::UnboundedSender<TopicMsg>,
+    mut topic_rx: mpsc::UnboundedReceiver<TopicMsg>,
     _close: TopicClose,
 ) {
     trace!("started");
 
-    let (events, _) = broadcast::channel(BROADCAST_BUFFER);
+    let (participants, _) = broadcast::channel(BROADCAST_BUFFER);
     let mut tags = HashMap::new();
 
-    while let Some(event) = topic_rx.recv().await {
-        trace!(?event);
-        match event {
-            ParticipantEvent::Ping => {}
-            ParticipantEvent::Join(join) => {
+    while let Some(msg) = topic_rx.recv().await {
+        trace!(?msg);
+        match msg {
+            TopicMsg::Ping => {}
+            TopicMsg::Join(join) => {
                 let (tag, alive) = if let Some(res) = tags
                     .get_key_value(&join.tag)
                     .and_then(|(k, v): (&Arc<str>, &Weak<()>)| Some((k.clone(), v.upgrade()?)))
@@ -287,7 +286,10 @@ async fn handle_topic(
                     (join.tag, alive)
                 };
 
-                if events.send(TopicEvent::Join(tag.clone())).is_err() {
+                if participants
+                    .send(ParticipantMsg::Join(tag.clone()))
+                    .is_err()
+                {
                     // all other participants have gone, but we're adding a new one, so we don't terminate
                     trace!("no participants to notify");
                 }
@@ -296,7 +298,7 @@ async fn handle_topic(
                     tag: tag.clone(),
                     topic_tx: topic_tx.clone(),
                     members: tags.keys().filter(|t| *t != &tag).cloned().collect(),
-                    events_rx: events.subscribe(),
+                    msg_rx: participants.subscribe(),
                     alive,
                 };
 
@@ -307,13 +309,13 @@ async fn handle_topic(
                     trace!(tag = %tag, "already dropped");
                 }
             }
-            ParticipantEvent::Leave(tag) => {
+            TopicMsg::Leave(tag) => {
                 if tags.get(&tag).and_then(Weak::upgrade).is_some() {
                     trace!(%tag, "has other connections");
                 } else {
                     trace!(%tag, "no more connections");
                     tags.remove(&tag);
-                    if events.send(TopicEvent::Leave(tag)).is_err() {
+                    if participants.send(ParticipantMsg::Leave(tag)).is_err() {
                         // all participants have gone, so the topic no longer needs handling
                         trace!("no participants to notify, terminating");
                         break;
