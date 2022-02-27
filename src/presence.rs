@@ -98,13 +98,22 @@ impl Stream for ParticipantEvents {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.events_rx
+        let item = self
+            .events_rx
             .poll_next_unpin(cx)
             .map_ok(|event| match event {
                 TopicEvent::Join(tag) => Event::Join(tag),
                 TopicEvent::Leave(tag) => Event::Leave(tag),
             })
-            .map_err(|_| Unavailable)
+            .map_err(|_| Unavailable)?;
+
+        match item {
+            Poll::Ready(Some(Event::Join(tag) | Event::Leave(tag))) if tag == self.tag => {
+                // skip it
+                self.poll_next(cx)
+            }
+            item => item.map(|opt| opt.map(Ok)),
+        }
     }
 }
 
@@ -286,7 +295,7 @@ async fn handle_topic(
                 let joined = Joined {
                     tag: tag.clone(),
                     topic_tx: topic_tx.clone(),
-                    members: tags.keys().cloned().collect(),
+                    members: tags.keys().filter(|t| *t != &tag).cloned().collect(),
                     events_rx: events.subscribe(),
                     alive,
                 };
