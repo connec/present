@@ -46,10 +46,11 @@ async fn connect(
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
 enum Message {
-    Members(Vec<Arc<str>>),
-    Join(Arc<str>),
-    Leave(Arc<str>),
+    Members { members: Vec<Arc<str>> },
+    Join { tag: Arc<str> },
+    Leave { tag: Arc<str> },
 }
 
 impl From<Message> for axum::extract::ws::Message {
@@ -84,15 +85,18 @@ async fn connection(presence: Presence, tag: String, topic: String, socket: WebS
         while socket_rx.next().await.is_some() {}
     });
 
-    socket_tx.send(Message::Members(members).into()).await.ok();
+    socket_tx
+        .send(Message::Members { members }.into())
+        .await
+        .ok();
 
     while let Some(Ok(event)) = events.next().await {
         match event {
             Event::Event(presence::Event::Join(tag)) => {
-                socket_tx.send(Message::Join(tag).into()).await.ok();
+                socket_tx.send(Message::Join { tag }.into()).await.ok();
             }
             Event::Event(presence::Event::Leave(tag)) => {
-                socket_tx.send(Message::Leave(tag).into()).await.ok();
+                socket_tx.send(Message::Leave { tag }.into()).await.ok();
             }
             Event::Closed => break,
         }
